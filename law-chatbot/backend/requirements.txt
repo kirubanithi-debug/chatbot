@@ -1,0 +1,9 @@
+Django==5.1
+djangorestframework
+celery[redis]
+chromadb
+langchain-community
+langchain-chroma
+langchain-ollama
+requests
+pandas
