@@ -46,6 +46,11 @@ def _safe_next_steps(value: str) -> str:
     return cleaned
 
 
+def _has_meaningful_value(value: str) -> bool:
+    cleaned = (value or '').strip()
+    return bool(cleaned) and not _is_placeholder(cleaned)
+
+
 def _response_block(law: str, section: str, punishment: str, next_steps: str) -> str:
     return (
         f"LAW: {(law or 'Consult lawyer').strip()}\n"
@@ -62,6 +67,37 @@ def _extract_field(context: str, label: str) -> str:
         if line.strip().startswith(prefix):
             return line.split(':', 1)[1].strip()
     return ''
+
+
+def _entry_to_context(entry: dict) -> str:
+    return (
+        f"LAW: {str(entry.get('law', '')).strip()}\n"
+        f"SECTION: {str(entry.get('section', '')).strip()}\n"
+        f"PUNISHMENT: {str(entry.get('punishment', '')).strip()}\n"
+        f"NEXT STEPS: {str(entry.get('next_steps', '')).strip()}\n"
+        f"KEYWORDS: {str(entry.get('keywords', '')).strip()}"
+    )
+
+
+def _entry_from_context(context: str) -> dict | None:
+    for block in context.split('\n\n'):
+        law = _extract_field(block, 'LAW')
+        section = _extract_field(block, 'SECTION')
+        if law and section:
+            return {
+                'law': law,
+                'section': section,
+                'punishment': _extract_field(block, 'PUNISHMENT'),
+                'next_steps': _extract_field(block, 'NEXT STEPS'),
+                'keywords': _extract_field(block, 'KEYWORDS'),
+            }
+    return None
+
+
+def _resolve_trusted_entry(entry: dict | None, context: str) -> dict | None:
+    if entry and str(entry.get('law', '')).strip() and str(entry.get('section', '')).strip():
+        return entry
+    return _entry_from_context(context)
 
 
 def format_response_from_context(context: str) -> str:
@@ -97,6 +133,20 @@ def format_response_from_entry(entry: dict) -> str:
 
 def normalize_ai_response(ai_response: str, entry: dict | None = None, context: str = '') -> str:
     base = ai_response or ''
+    trusted_entry = _resolve_trusted_entry(entry=entry, context=context)
+
+    # Lock legal grounding to retrieved context so model hallucinations cannot replace law/section/punishment.
+    if trusted_entry:
+        next_steps = _extract_field(base, 'NEXT STEPS')
+        if not _has_meaningful_value(next_steps):
+            next_steps = str(trusted_entry.get('next_steps', '')).strip()
+        return _response_block(
+            law=str(trusted_entry.get('law', '')).strip(),
+            section=str(trusted_entry.get('section', '')).strip(),
+            punishment=str(trusted_entry.get('punishment', '')).strip(),
+            next_steps=next_steps,
+        )
+
     law = _extract_field(base, 'LAW')
     section = _extract_field(base, 'SECTION')
     punishment = _extract_field(base, 'PUNISHMENT')
@@ -174,24 +224,23 @@ def process_legal_query(legal_query_id: int) -> None:
     lookup_query = understanding.enriched_query or legal_query.user_query
 
     entry = find_best_legal_entry(lookup_query)
-    if entry and entry.get('confidence', 0) >= 0.42:
+    if entry and entry.get('confidence', 0) >= 0.36:
         legal_query.ai_response = format_response_from_entry(entry)
         legal_query.status = 'completed'
         legal_query.save(update_fields=['ai_response', 'status', 'updated_at'])
         return
 
-    context = get_context(lookup_query, k=3)
+    context = get_context(lookup_query, k=1)
 
     if not context.strip() and entry:
-        context = (
-            f"LAW: {entry.get('law', '')}\n"
-            f"SECTION: {entry.get('section', '')}\n"
-            f"PUNISHMENT: {entry.get('punishment', '')}\n"
-            f"NEXT STEPS: {entry.get('next_steps', '')}\n"
-            f"KEYWORDS: {entry.get('keywords', '')}"
-        )
+        context = _entry_to_context(entry)
 
-    if not context.strip():
+    trusted_entry = _resolve_trusted_entry(entry=entry, context=context)
+
+    if trusted_entry:
+        context = _entry_to_context(trusted_entry)
+
+    if not context.strip() or not trusted_entry:
         legal_query.ai_response = get_default_guidance_response(legal_query.user_query)
         legal_query.status = 'completed'
         legal_query.save(update_fields=['ai_response', 'status', 'updated_at'])
@@ -201,12 +250,12 @@ def process_legal_query(legal_query_id: int) -> None:
     try:
         ai_response = ask_ollama(prompt)
     except requests.RequestException:
-        ai_response = format_response_from_entry(entry) if entry else format_response_from_context(context)
+        ai_response = format_response_from_entry(trusted_entry)
 
     if not ai_response.strip() or 'LAW:' not in ai_response:
-        ai_response = format_response_from_entry(entry) if entry else format_response_from_context(context)
+        ai_response = format_response_from_entry(trusted_entry)
 
-    ai_response = normalize_ai_response(ai_response=ai_response, entry=entry, context=context)
+    ai_response = normalize_ai_response(ai_response=ai_response, entry=trusted_entry, context=context)
 
     legal_query.ai_response = ai_response or get_default_guidance_response(legal_query.user_query)
     legal_query.status = 'completed'
